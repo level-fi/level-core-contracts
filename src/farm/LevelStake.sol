@@ -2,19 +2,19 @@
 pragma solidity 0.8.15;
 
 import {SafeERC20, IERC20} from "openzeppelin/token/ERC20/utils/SafeERC20.sol";
-import {Ownable} from "openzeppelin/access/Ownable.sol";
 import {ERC20} from "openzeppelin/token/ERC20/ERC20.sol";
+import {OwnableUpgradeable} from "openzeppelin-upgradeable/access/OwnableUpgradeable.sol";
 import {Initializable} from "openzeppelin-upgradeable/proxy/utils/Initializable.sol";
 import {ITransferHook} from "../interfaces/ITransferHook.sol";
-import {ILevelStaking} from "../interfaces/ILevelStaking.sol";
-import {ILevelReserve} from "../interfaces/ILevelReserve.sol";
+import {ILevelStake} from "../interfaces/ILevelStake.sol";
+import {ITokenReserve} from "../interfaces/ITokenReserve.sol";
 
 /**
- * @title LevelStaking
+ * @title LevelStake
  * @notice Contract to stake LVL token and earn LGO reward.
  * @author Level
- **/
-contract LevelStaking is Initializable, Ownable, ILevelStaking {
+ */
+contract LevelStake is Initializable, OwnableUpgradeable, ILevelStake {
     using SafeERC20 for IERC20;
 
     struct UserInfo {
@@ -28,10 +28,9 @@ contract LevelStaking is Initializable, Ownable, ILevelStaking {
     IERC20 public LVL;
     IERC20 public LGO;
 
-    ILevelReserve public rewardsReserve;
+    ITokenReserve public lgoReserve;
     uint256 public cooldownSeconds;
     uint256 public unstakeWindow;
-
     uint256 public rewardPerSecond;
     uint256 public accRewardPerShare;
     uint256 public lastRewardTime;
@@ -40,34 +39,26 @@ contract LevelStaking is Initializable, Ownable, ILevelStaking {
 
     /**
      * @dev Called by the proxy contract
-     **/
+     *
+     */
     function initialize(
         address _lvl,
         address _lgo,
         uint256 _cooldownSeconds,
         uint256 _unstakeWindow,
         uint256 _rewardPerSecond,
-        address _rewardsReserve
-    ) external initializer {
+        address _lgoReserve
+    )
+        external
+        initializer
+    {
+        __Ownable_init();
         LVL = IERC20(_lvl);
         LGO = IERC20(_lgo);
         cooldownSeconds = _cooldownSeconds;
         unstakeWindow = _unstakeWindow;
-
         rewardPerSecond = _rewardPerSecond;
-        rewardsReserve = ILevelReserve(_rewardsReserve);
-    }
-
-    function update() internal {
-        if (block.timestamp > lastRewardTime) {
-            uint256 lvlSupply = LVL.balanceOf(address(this));
-            if (lvlSupply > 0) {
-                uint256 time = block.timestamp - lastRewardTime;
-                uint256 reward = time * rewardPerSecond;
-                accRewardPerShare = accRewardPerShare + ((reward * ACC_REWARD_PRECISION) / lvlSupply);
-            }
-            lastRewardTime = block.timestamp;
-        }
+        lgoReserve = ITokenReserve(_lgoReserve);
     }
 
     /* ========== VIEW FUNCTIONS ========== */
@@ -95,7 +86,7 @@ contract LevelStaking is Initializable, Ownable, ILevelStaking {
      * @dev Staked LVL tokens, and start earning rewards
      * @param _to Address to stake to
      * @param _amount Amount to stake
-     **/
+     */
     function stake(address _to, uint256 _amount) external override {
         update();
         require(_amount != 0, "INVALID_AMOUNT");
@@ -103,7 +94,10 @@ contract LevelStaking is Initializable, Ownable, ILevelStaking {
 
         if (user.amount > 0) {
             uint256 pending = (user.amount * accRewardPerShare) / ACC_REWARD_PRECISION - user.rewardDebt;
-            rewardsReserve.requestTransfer(_to, pending);
+            if (pending > 0) {
+                lgoReserve.requestTransfer(_to, pending);
+                emit RewardsClaimed(msg.sender, _to, pending);
+            }
         }
 
         user.cooldowns = getNextCooldownTimestamp(0, _amount, _to, user.amount);
@@ -119,7 +113,7 @@ contract LevelStaking is Initializable, Ownable, ILevelStaking {
      * @dev Unstake tokens, and stop earning rewards
      * @param _to Address to unstake to
      * @param _amount Amount to unstake
-     **/
+     */
     function unstake(address _to, uint256 _amount) external override {
         update();
         require(_amount != 0, "INVALID_AMOUNT");
@@ -129,8 +123,7 @@ contract LevelStaking is Initializable, Ownable, ILevelStaking {
 
         require(block.timestamp > cooldownStartTimestamp + cooldownSeconds, "INSUFFICIENT_COOLDOWN");
         require(
-            block.timestamp - (cooldownStartTimestamp + cooldownSeconds) <= unstakeWindow,
-            "UNSTAKE_WINDOW_FINISHED"
+            block.timestamp - (cooldownStartTimestamp + cooldownSeconds) <= unstakeWindow, "UNSTAKE_WINDOW_FINISHED"
         );
 
         uint256 amountToUnstake = (_amount > user.amount) ? user.amount : _amount;
@@ -142,8 +135,13 @@ contract LevelStaking is Initializable, Ownable, ILevelStaking {
         }
 
         user.amount -= amountToUnstake;
+        user.rewardDebt = (user.amount * accRewardPerShare) / ACC_REWARD_PRECISION;
 
-        rewardsReserve.requestTransfer(_to, pending);
+        if (pending > 0) {
+            lgoReserve.requestTransfer(_to, pending);
+            emit RewardsClaimed(msg.sender, _to, pending);
+        }
+
         IERC20(LVL).safeTransfer(_to, amountToUnstake);
 
         emit Unstaked(msg.sender, _to, amountToUnstake);
@@ -152,7 +150,7 @@ contract LevelStaking is Initializable, Ownable, ILevelStaking {
     /**
      * @dev Activates the cooldown period to unstake
      * - It can't be called if the user is not staking
-     **/
+     */
     function cooldown() external override {
         UserInfo storage user = userInfo[msg.sender];
 
@@ -165,7 +163,7 @@ contract LevelStaking is Initializable, Ownable, ILevelStaking {
     /**
      * @dev Claims LGO rewards to the address `to`
      * @param _to Address to stake for
-     **/
+     */
     function claimRewards(address _to) external {
         update();
         UserInfo storage user = userInfo[msg.sender];
@@ -176,31 +174,36 @@ contract LevelStaking is Initializable, Ownable, ILevelStaking {
         user.rewardDebt = accumulatedReward;
 
         if (_pendingReward != 0) {
-            rewardsReserve.requestTransfer(_to, _pendingReward);
+            lgoReserve.requestTransfer(_to, _pendingReward);
             emit RewardsClaimed(msg.sender, _to, _pendingReward);
         }
     }
 
     /**
      * @dev Calculates the how is gonna be a new cooldown timestamp depending on the sender/receiver situation
-     *  - If the timestamp of the sender is "better" or the timestamp of the recipient is 0, we take the one of the recipient
-     *  - Weighted average of from/to cooldown timestamps if:
-     *    # The sender doesn't have the cooldown activated (timestamp 0).
-     *    # The sender timestamp is expired
-     *    # The sender has a "worse" timestamp
-     *  - If the receiver's cooldown timestamp expired (too old), the next is 0
+     * - If the timestamp of the sender is "better" or the timestamp of the recipient is 0, we take the one of the recipient
+     * - Weighted average of from/to cooldown timestamps if:
+     * # The sender doesn't have the cooldown activated (timestamp 0).
+     * # The sender timestamp is expired
+     * # The sender has a "worse" timestamp
+     * - If the receiver's cooldown timestamp expired (too old), the next is 0
      * @param _fromCooldownTimestamp Cooldown timestamp of the sender
      * @param _amountToReceive Amount
      * @param _to Address of the recipient
      * @param _toBalance Current balance of the receiver
      * @return The new cooldown timestamp
-     **/
+     *
+     */
     function getNextCooldownTimestamp(
         uint256 _fromCooldownTimestamp,
         uint256 _amountToReceive,
         address _to,
         uint256 _toBalance
-    ) public view returns (uint256) {
+    )
+        public
+        view
+        returns (uint256)
+    {
         UserInfo storage user = userInfo[_to];
 
         uint256 toCooldownTimestamp = user.cooldowns;
@@ -213,16 +216,14 @@ contract LevelStaking is Initializable, Ownable, ILevelStaking {
         if (minimalValidCooldownTimestamp > toCooldownTimestamp) {
             toCooldownTimestamp = 0;
         } else {
-            _fromCooldownTimestamp = (minimalValidCooldownTimestamp > _fromCooldownTimestamp)
-                ? block.timestamp
-                : _fromCooldownTimestamp;
+            _fromCooldownTimestamp =
+                (minimalValidCooldownTimestamp > _fromCooldownTimestamp) ? block.timestamp : _fromCooldownTimestamp;
 
             if (_fromCooldownTimestamp < toCooldownTimestamp) {
                 return toCooldownTimestamp;
             } else {
-                toCooldownTimestamp =
-                    (_amountToReceive * _fromCooldownTimestamp + (_toBalance * toCooldownTimestamp)) /
-                    (_amountToReceive + _toBalance);
+                toCooldownTimestamp = (_amountToReceive * _fromCooldownTimestamp + (_toBalance * toCooldownTimestamp))
+                    / (_amountToReceive + _toBalance);
             }
         }
         return toCooldownTimestamp;
@@ -236,6 +237,19 @@ contract LevelStaking is Initializable, Ownable, ILevelStaking {
         update();
         rewardPerSecond = _rewardPerSecond;
         emit RewardPerSecondUpdated(_rewardPerSecond);
+    }
+
+    /* ========== INTERNAL FUNCTIONS ========== */
+    function update() internal {
+        if (block.timestamp > lastRewardTime) {
+            uint256 lvlSupply = LVL.balanceOf(address(this));
+            if (lvlSupply > 0) {
+                uint256 time = block.timestamp - lastRewardTime;
+                uint256 reward = time * rewardPerSecond;
+                accRewardPerShare = accRewardPerShare + ((reward * ACC_REWARD_PRECISION) / lvlSupply);
+            }
+            lastRewardTime = block.timestamp;
+        }
     }
 
     /* ========== EVENT ========== */

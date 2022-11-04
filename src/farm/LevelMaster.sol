@@ -1,19 +1,23 @@
 // SPDX-License-Identifier: MIT
 
 pragma solidity 0.8.15;
-pragma experimental ABIEncoderV2;
 
+pragma experimental ABIEncoderV2;
 
 import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
 import {SafeERC20} from "openzeppelin/token/ERC20/utils/SafeERC20.sol";
+import {ReentrancyGuard} from "openzeppelin/security/ReentrancyGuard.sol";
 import {Ownable} from "openzeppelin/access/Ownable.sol";
+import {IPool} from "../interfaces/IPool.sol";
+import {ILPToken} from "../interfaces/ILPToken.sol";
+import {UniERC20} from "../lib/UniERC20.sol";
 import "../interfaces/IRewarder.sol";
-import "../interfaces/ILevelReserve.sol";
-import "../interfaces/ILevelStaking.sol";
+import "../interfaces/ITokenReserve.sol";
+import "../interfaces/ILevelStake.sol";
 
 /// @title LevelMaster
 /// Inspired by Sushiswap's MinichefV2
-contract LevelMaster is Ownable {
+contract LevelMaster is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     /// @notice Info of each MCV2 user.
@@ -35,21 +39,24 @@ contract LevelMaster is Ownable {
 
     /// @notice Address of LEVEL contract.
     // IERC20 public immutable LEVEL;
-    ILevelReserve public immutable LEVEL_RESERVE;
-    ILevelStaking public immutable STAKED_TOKEN;
+    ITokenReserve public immutable LEVEL_RESERVE;
 
     /// @notice Info of each MCV2 pool.
     PoolInfo[] public poolInfo;
+
     /// @notice Address of the LP token for each MCV2 pool.
     IERC20[] public lpToken;
+
     /// @notice Address of each `IRewarder` contract in MCV2.
     IRewarder[] public rewarder;
 
+    IPool public immutable levelPool;
+
     /// @notice Info of each user that stakes LP tokens.
-    mapping (uint256 => mapping (address => UserInfo)) public userInfo;
+    mapping(uint256 => mapping(address => UserInfo)) public userInfo;
 
     /// @dev Tokens added
-    mapping (address => bool) public addedTokens;
+    mapping(address => bool) public addedTokens;
 
     /// @dev Total allocation points. Must be the sum of all allocation points in all pools.
     uint256 public totalAllocPoint;
@@ -57,19 +64,48 @@ contract LevelMaster is Ownable {
     uint256 public rewardPerSecond;
     uint256 private constant ACC_REWARD_PRECISION = 1e12;
 
-    event Deposit(address indexed user, uint256 indexed pid, uint256 amount, address indexed to);
-    event Withdraw(address indexed user, uint256 indexed pid, uint256 amount, address indexed to);
-    event EmergencyWithdraw(address indexed user, uint256 indexed pid, uint256 amount, address indexed to);
+    event Deposit(
+        address indexed user,
+        uint256 indexed pid,
+        uint256 amount,
+        address indexed to
+    );
+    event Withdraw(
+        address indexed user,
+        uint256 indexed pid,
+        uint256 amount,
+        address indexed to
+    );
+    event EmergencyWithdraw(
+        address indexed user,
+        uint256 indexed pid,
+        uint256 amount,
+        address indexed to
+    );
     event Harvest(address indexed user, uint256 indexed pid, uint256 amount);
-    event LogPoolAddition(uint256 indexed pid, uint256 allocPoint, IERC20 indexed lpToken, IRewarder indexed rewarder);
-    event LogSetPool(uint256 indexed pid, uint256 allocPoint, IRewarder indexed rewarder, bool overwrite);
-    event LogUpdatePool(uint256 indexed pid, uint64 lastRewardTime, uint256 lpSupply, uint256 accRewardPerShare);
+    event LogPoolAddition(
+        uint256 indexed pid,
+        uint256 allocPoint,
+        IERC20 indexed lpToken,
+        IRewarder indexed rewarder
+    );
+    event LogSetPool(
+        uint256 indexed pid,
+        uint256 allocPoint,
+        IRewarder indexed rewarder,
+        bool overwrite
+    );
+    event LogUpdatePool(
+        uint256 indexed pid,
+        uint64 lastRewardTime,
+        uint256 lpSupply,
+        uint256 accRewardPerShare
+    );
     event LogRewardPerSecond(uint256 rewardPerSecond);
 
-    constructor(address _level, address _reserve, address _stakedToken) {
-        LEVEL_RESERVE = ILevelReserve(_reserve);
-        STAKED_TOKEN = ILevelStaking(_stakedToken);
-        IERC20(_level).safeApprove(_stakedToken, type(uint256).max);
+    constructor(address _reserve, address _levelPool) {
+        LEVEL_RESERVE = ITokenReserve(_reserve);
+        levelPool = IPool(_levelPool);
     }
 
     /// @notice Returns the number of MCV2 pools.
@@ -82,19 +118,26 @@ contract LevelMaster is Ownable {
     /// @param allocPoint AP of the new pool.
     /// @param _lpToken Address of the LP ERC-20 token.
     /// @param _rewarder Address of the rewarder delegate.
-    function add(uint256 allocPoint, IERC20 _lpToken, IRewarder _rewarder) public onlyOwner {
+    function add(uint256 allocPoint, IERC20 _lpToken, IRewarder _rewarder)
+        public
+        onlyOwner
+    {
         require(addedTokens[address(_lpToken)] == false, "Token already added");
         totalAllocPoint = totalAllocPoint + allocPoint;
         lpToken.push(_lpToken);
         rewarder.push(_rewarder);
 
-        poolInfo.push(PoolInfo({
-            allocPoint: uint64(allocPoint),
-            lastRewardTime: uint64(block.timestamp),
-            accRewardPerShare: 0
-        }));
+        poolInfo.push(
+            PoolInfo({
+                allocPoint: uint64(allocPoint),
+                lastRewardTime: uint64(block.timestamp),
+                accRewardPerShare: 0
+            })
+        );
         addedTokens[address(_lpToken)] = true;
-        emit LogPoolAddition(lpToken.length - 1, allocPoint, _lpToken, _rewarder);
+        emit LogPoolAddition(
+            lpToken.length - 1, allocPoint, _lpToken, _rewarder
+            );
     }
 
     /// @notice Update the given pool's REWARD allocation point and `IRewarder` contract. Can only be called by the owner.
@@ -102,11 +145,24 @@ contract LevelMaster is Ownable {
     /// @param _allocPoint New AP of the pool.
     /// @param _rewarder Address of the rewarder delegate.
     /// @param overwrite True if _rewarder should be `set`. Otherwise `_rewarder` is ignored.
-    function set(uint256 _pid, uint256 _allocPoint, IRewarder _rewarder, bool overwrite) public onlyOwner {
-        totalAllocPoint = totalAllocPoint - poolInfo[_pid].allocPoint + _allocPoint;
+    function set(
+        uint256 _pid,
+        uint256 _allocPoint,
+        IRewarder _rewarder,
+        bool overwrite
+    )
+        public
+        onlyOwner
+    {
+        totalAllocPoint =
+            totalAllocPoint - poolInfo[_pid].allocPoint + _allocPoint;
         poolInfo[_pid].allocPoint = uint64(_allocPoint);
-        if (overwrite) { rewarder[_pid] = _rewarder; }
-        emit LogSetPool(_pid, _allocPoint, overwrite ? _rewarder : rewarder[_pid], overwrite);
+        if (overwrite) {
+            rewarder[_pid] = _rewarder;
+        }
+        emit LogSetPool(
+            _pid, _allocPoint, overwrite ? _rewarder : rewarder[_pid], overwrite
+            );
     }
 
     /// @notice Sets the reward per second to be distributed. Can only be called by the owner.
@@ -120,17 +176,26 @@ contract LevelMaster is Ownable {
     /// @param _pid The index of the pool. See `poolInfo`.
     /// @param _user Address of user.
     /// @return pending LEVEL reward for a given user.
-    function pendingReward(uint256 _pid, address _user) external view returns (uint256 pending) {
+    function pendingReward(uint256 _pid, address _user)
+        external
+        view
+        returns (uint256 pending)
+    {
         PoolInfo memory pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][_user];
         uint256 accRewardPerShare = pool.accRewardPerShare;
         uint256 lpSupply = lpToken[_pid].balanceOf(address(this));
         if (block.timestamp > pool.lastRewardTime && lpSupply != 0) {
             uint256 time = block.timestamp - pool.lastRewardTime;
-            uint256 reward = time * rewardPerSecond * pool.allocPoint / totalAllocPoint;
-            accRewardPerShare = accRewardPerShare + (reward * ACC_REWARD_PRECISION / lpSupply);
+            uint256 reward =
+                time * rewardPerSecond * pool.allocPoint / totalAllocPoint;
+            accRewardPerShare =
+                accRewardPerShare + (reward * ACC_REWARD_PRECISION / lpSupply);
         }
-        pending = uint256(int256(user.amount * accRewardPerShare / ACC_REWARD_PRECISION) - user.rewardDebt);
+        pending = uint256(
+            int256(user.amount * accRewardPerShare / ACC_REWARD_PRECISION)
+                - user.rewardDebt
+        );
     }
 
     /// @notice Update reward variables for all pools. Be careful of gas spending!
@@ -151,12 +216,16 @@ contract LevelMaster is Ownable {
             uint256 lpSupply = lpToken[pid].balanceOf(address(this));
             if (lpSupply > 0) {
                 uint256 time = block.timestamp - pool.lastRewardTime;
-                uint256 reward = time * rewardPerSecond * pool.allocPoint / totalAllocPoint;
-                pool.accRewardPerShare = pool.accRewardPerShare + uint128(reward * ACC_REWARD_PRECISION / lpSupply);
+                uint256 reward =
+                    time * rewardPerSecond * pool.allocPoint / totalAllocPoint;
+                pool.accRewardPerShare = pool.accRewardPerShare
+                    + uint128(reward * ACC_REWARD_PRECISION / lpSupply);
             }
             pool.lastRewardTime = uint64(block.timestamp);
             poolInfo[pid] = pool;
-            emit LogUpdatePool(pid, pool.lastRewardTime, lpSupply, pool.accRewardPerShare);
+            emit LogUpdatePool(
+                pid, pool.lastRewardTime, lpSupply, pool.accRewardPerShare
+                );
         }
     }
 
@@ -165,21 +234,8 @@ contract LevelMaster is Ownable {
     /// @param amount LP token amount to deposit.
     /// @param to The receiver of `amount` deposit benefit.
     function deposit(uint256 pid, uint256 amount, address to) public {
-        PoolInfo memory pool = updatePool(pid);
-        UserInfo storage user = userInfo[pid][to];
-
-        // Effects
-        user.amount = user.amount + amount;
-        user.rewardDebt = user.rewardDebt + int256(amount * pool.accRewardPerShare / ACC_REWARD_PRECISION);
-
-        // Interactions
-        IRewarder _rewarder = rewarder[pid];
-        if (address(_rewarder) != address(0)) {
-            _rewarder.onReward(pid, to, to, 0, user.amount);
-        }
-
+        _deposit(pid, amount, to);
         lpToken[pid].safeTransferFrom(msg.sender, address(this), amount);
-
         emit Deposit(msg.sender, pid, amount, to);
     }
 
@@ -192,7 +248,8 @@ contract LevelMaster is Ownable {
         UserInfo storage user = userInfo[pid][msg.sender];
 
         // Effects
-        user.rewardDebt = user.rewardDebt - int256(amount * pool.accRewardPerShare / ACC_REWARD_PRECISION);
+        user.rewardDebt = user.rewardDebt
+            - int256(amount * pool.accRewardPerShare / ACC_REWARD_PRECISION);
         user.amount = user.amount - amount;
 
         // Interactions
@@ -212,7 +269,8 @@ contract LevelMaster is Ownable {
     function harvest(uint256 pid, address to) public {
         PoolInfo memory pool = updatePool(pid);
         UserInfo storage user = userInfo[pid][msg.sender];
-        int256 accumulatedReward = int256(user.amount * pool.accRewardPerShare / ACC_REWARD_PRECISION);
+        int256 accumulatedReward =
+            int256(user.amount * pool.accRewardPerShare / ACC_REWARD_PRECISION);
         uint256 _pendingReward = uint256(accumulatedReward - user.rewardDebt);
 
         // Effects
@@ -220,13 +278,12 @@ contract LevelMaster is Ownable {
 
         // Interactions
         if (_pendingReward != 0) {
-            LEVEL_RESERVE.requestTransfer(address(this), _pendingReward);
-            STAKED_TOKEN.stake(to, _pendingReward);
+            LEVEL_RESERVE.requestTransfer(to, _pendingReward);
         }
 
         IRewarder _rewarder = rewarder[pid];
         if (address(_rewarder) != address(0)) {
-            _rewarder.onReward( pid, msg.sender, to, _pendingReward, user.amount);
+            _rewarder.onReward(pid, msg.sender, to, _pendingReward, user.amount);
         }
 
         emit Harvest(msg.sender, pid, _pendingReward);
@@ -242,29 +299,64 @@ contract LevelMaster is Ownable {
     /// @param pid The index of the pool. See `poolInfo`.
     /// @param amount LP token amount to withdraw.
     /// @param to Receiver of the LP tokens and REWARD rewards.
-    function withdrawAndHarvest(uint256 pid, uint256 amount, address to) public {
-        PoolInfo memory pool = updatePool(pid);
-        UserInfo storage user = userInfo[pid][msg.sender];
-        int256 accumulatedReward = int256(user.amount * pool.accRewardPerShare / ACC_REWARD_PRECISION);
-        uint256 _pendingReward = uint256(accumulatedReward - user.rewardDebt);
-
-        // Effects
-        user.rewardDebt = accumulatedReward - int256(amount * pool.accRewardPerShare / ACC_REWARD_PRECISION);
-        user.amount = user.amount - amount;
-
-        // Interactions
-        LEVEL_RESERVE.requestTransfer(address(this), _pendingReward);
-        STAKED_TOKEN.stake(to, _pendingReward);
-
-        IRewarder _rewarder = rewarder[pid];
-        if (address(_rewarder) != address(0)) {
-            _rewarder.onReward(pid, msg.sender, to, _pendingReward, user.amount);
-        }
-
+    function withdrawAndHarvest(uint256 pid, uint256 amount, address to)
+        public
+    {
+        _withdrawAndHarvest(pid, amount, to);
         lpToken[pid].safeTransfer(to, amount);
+    }
 
-        emit Withdraw(msg.sender, pid, amount, to);
-        emit Harvest(msg.sender, pid, _pendingReward);
+    function addLiquidity(
+        uint256 pid,
+        address assetToken,
+        uint256 assetAmount,
+        uint256 minLpAmount,
+        address to
+    )
+        external
+        payable
+        nonReentrant
+    {
+        require(assetAmount > 0, "Invalid input");
+        address tranche = address(lpToken[pid]);
+        uint256 balanceLpTokenBefore =
+            ILPToken(tranche).balanceOf(address(this));
+        if (assetToken != UniERC20.ETH) {
+            IERC20(assetToken).safeTransferFrom(
+                msg.sender, address(this), assetAmount
+            );
+            IERC20(assetToken).approve(address(levelPool), 0);
+            IERC20(assetToken).approve(address(levelPool), assetAmount);
+            levelPool.addLiquidity(
+                tranche, assetToken, assetAmount, minLpAmount, address(this)
+            );
+        } else {
+            require(msg.value == assetAmount, "Invalid amount transfer");
+            levelPool.addLiquidity{value: assetAmount}(
+                tranche, assetToken, assetAmount, minLpAmount, address(this)
+            );
+        }
+        uint256 balanceLpTokenAfter = ILPToken(tranche).balanceOf(address(this));
+        uint256 lpAmount = balanceLpTokenAfter - balanceLpTokenBefore;
+        require(lpAmount > 0, "Invalid LP amount");
+        _deposit(pid, lpAmount, to);
+    }
+
+    function removeLiquidity(
+        uint256 pid,
+        uint256 lpAmount,
+        address toToken,
+        uint256 minOut,
+        address to
+    )
+        external
+        nonReentrant
+    {
+        _withdrawAndHarvest(pid, lpAmount, to);
+        address tranche = address(lpToken[pid]);
+        IERC20(tranche).approve(address(levelPool), 0);
+        IERC20(tranche).approve(address(levelPool), lpAmount);
+        levelPool.removeLiquidity(tranche, toToken, lpAmount, minOut, to);
     }
 
     /// @notice Withdraw without caring about rewards. EMERGENCY ONLY.
@@ -284,5 +376,48 @@ contract LevelMaster is Ownable {
         // Note: transfer can fail or succeed if `amount` is zero.
         lpToken[pid].safeTransfer(to, amount);
         emit EmergencyWithdraw(msg.sender, pid, amount, to);
+    }
+
+    //internal
+    function _deposit(uint256 pid, uint256 amount, address to) internal {
+        PoolInfo memory pool = updatePool(pid);
+        UserInfo storage user = userInfo[pid][to];
+
+        // Effects
+        user.amount = user.amount + amount;
+        user.rewardDebt = user.rewardDebt
+            + int256(amount * pool.accRewardPerShare / ACC_REWARD_PRECISION);
+
+        // Interactions
+        IRewarder _rewarder = rewarder[pid];
+        if (address(_rewarder) != address(0)) {
+            _rewarder.onReward(pid, msg.sender, to, 0, user.amount);
+        }
+        emit Deposit(msg.sender, pid, amount, to);
+    }
+
+    function _withdrawAndHarvest(uint256 pid, uint256 amount, address to)
+        internal
+    {
+        PoolInfo memory pool = updatePool(pid);
+        UserInfo storage user = userInfo[pid][msg.sender];
+        int256 accumulatedReward =
+            int256(user.amount * pool.accRewardPerShare / ACC_REWARD_PRECISION);
+        uint256 _pendingReward = uint256(accumulatedReward - user.rewardDebt);
+
+        // Effects
+        user.rewardDebt = accumulatedReward
+            - int256(amount * pool.accRewardPerShare / ACC_REWARD_PRECISION);
+        user.amount = user.amount - amount;
+
+        // Interactions
+        LEVEL_RESERVE.requestTransfer(to, _pendingReward);
+
+        IRewarder _rewarder = rewarder[pid];
+        if (address(_rewarder) != address(0)) {
+            _rewarder.onReward(pid, msg.sender, to, _pendingReward, user.amount);
+        }
+        emit Withdraw(msg.sender, pid, amount, to);
+        emit Harvest(msg.sender, pid, _pendingReward);
     }
 }
