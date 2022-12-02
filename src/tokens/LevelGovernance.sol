@@ -2,10 +2,8 @@
 
 pragma solidity 0.8.15;
 
-import {ERC20} from "openzeppelin/token/ERC20/ERC20.sol";
 import {Initializable} from "openzeppelin-upgradeable/proxy/utils/Initializable.sol";
 import {GovernancePowerDelegationERC20} from "../lib/GovernancePowerDelegationERC20.sol";
-import {ITransferHook} from "../interfaces/ITransferHook.sol";
 
 /**
  * @notice implementation of the LevelGovernance token contract
@@ -21,11 +19,6 @@ contract LevelGovernance is Initializable, GovernancePowerDelegationERC20 {
     mapping(address => mapping(uint256 => Snapshot)) public _votingSnapshots;
 
     mapping(address => uint256) public _votingSnapshotsCounts;
-
-    /// @dev reference to the Level governance contract to call (if initialized) on _beforeTokenTransfer
-    /// !!! IMPORTANT The Level governance is considered a trustable contract, being its responsibility
-    /// to control all potential reentrancies by calling back the LevelToken
-    ITransferHook public _levelGovernance;
 
     bytes32 public DOMAIN_SEPARATOR;
     bytes public constant EIP712_REVISION = bytes("1");
@@ -43,7 +36,7 @@ contract LevelGovernance is Initializable, GovernancePowerDelegationERC20 {
 
     function initialize() external initializer {
         __ERC20_init("Level Governance Token", "LGO");
-        _mint(msg.sender, MAX_SUPPLY);
+        _mint(_msgSender(), MAX_SUPPLY);
     }
 
     /**
@@ -106,12 +99,6 @@ contract LevelGovernance is Initializable, GovernancePowerDelegationERC20 {
         address propPowerToDelegatee = _getDelegatee(to, _propositionPowerDelegates);
 
         _moveDelegatesByType(propPowerFromDelegatee, propPowerToDelegatee, amount, DelegationType.PROPOSITION_POWER);
-
-        // caching the level governance address to avoid multiple state loads
-        ITransferHook levelGovernance = _levelGovernance;
-        if (levelGovernance != ITransferHook(address(0))) {
-            levelGovernance.onTransfer(from, to, amount);
-        }
     }
 
     function _getDelegationDataByType(DelegationType delegationType)

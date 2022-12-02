@@ -6,12 +6,12 @@ import {SafeERC20, IERC20} from "openzeppelin/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "openzeppelin/access/Ownable.sol";
 import {ReentrancyGuard} from "openzeppelin/security/ReentrancyGuard.sol";
 import {IPool} from "../interfaces/IPool.sol";
+import {IWETH} from "../interfaces/IWETH.sol";
 import {ILevelMaster} from "../interfaces/ILevelMaster.sol";
-import {UniERC20} from "../lib/UniERC20.sol";
 
 contract LockDrop is Ownable, ReentrancyGuard {
-    using UniERC20 for IERC20;
     using SafeERC20 for IERC20;
+    using SafeERC20 for IWETH;
 
     struct UserInfo {
         uint256 amount;
@@ -20,12 +20,12 @@ contract LockDrop is Ownable, ReentrancyGuard {
     }
 
     uint256 private constant PRECISION = 1e6;
-    uint256 private constant MAX_CAP = 1_000_000 ether;
-    uint256 private constant TOTAL_REWARDS = 100_000 ether;
+    uint256 private immutable BASE_REWARDS;
     /// @notice share of rewards distributed for early depositor
-    uint256 private constant BONUS_REWARD_RATIO = 10000; // 1%
+    uint256 private immutable BONUS_REWARDS;
 
     IERC20 public immutable rewardToken;
+    IWETH public immutable weth;
 
     // Level Pool
     IERC20 public immutable lp;
@@ -50,6 +50,7 @@ contract LockDrop is Ownable, ReentrancyGuard {
     mapping(address => UserInfo) public userInfo;
 
     constructor(
+        address _weth,
         address _lp,
         address _pool,
         address _levelMaster,
@@ -57,13 +58,15 @@ contract LockDrop is Ownable, ReentrancyGuard {
         address _rewardToken,
         uint256 _startTime,
         uint256 _lockTime,
-        uint256 _unlockTime
+        uint256 _unlockTime,
+        uint256 baseRewards,
+        uint256 bonusRewards
     ) {
         require(
             block.timestamp <= _startTime && _startTime < _lockTime && _lockTime < _unlockTime,
             "LockDrop::constructor: Time not valid"
         );
-
+        weth = IWETH(_weth);
         lp = IERC20(_lp);
         pool = IPool(_pool);
         levelMaster = ILevelMaster(_levelMaster);
@@ -72,6 +75,15 @@ contract LockDrop is Ownable, ReentrancyGuard {
         startTime = _startTime;
         lockTime = _lockTime;
         unlockTime = _unlockTime;
+        BASE_REWARDS = baseRewards;
+        BONUS_REWARDS = bonusRewards;
+    }
+
+    modifier onlyActive() {
+        uint256 _now = block.timestamp;
+        require(lockTime > _now, "LockDrop::deposit: locked");
+        require(startTime <= _now, "LockDrop::deposit: not start");
+        _;
     }
 
     // =============== VIEWS ===============
@@ -86,11 +98,9 @@ contract LockDrop is Ownable, ReentrancyGuard {
         uint256 time = _now <= unlockTime ? _now - lockTime : unlockTime - lockTime;
         uint256 lockDuration = unlockTime - lockTime;
 
-        uint256 reward =
-            (user.amount * time * TOTAL_REWARDS * (PRECISION - BONUS_REWARD_RATIO)) / lockDuration / totalAmount / PRECISION;
+        uint256 reward = (user.amount * time * BASE_REWARDS) / lockDuration / totalAmount;
+        uint256 bonusReward = (user.boostedAmount * time * BONUS_REWARDS) / lockDuration / (totalBoostedAmount);
 
-        uint256 bonusReward = (user.boostedAmount * time * TOTAL_REWARDS * BONUS_REWARD_RATIO) / lockDuration
-            / (totalBoostedAmount) / PRECISION;
         return reward + bonusReward - user.rewardDebt;
     }
 
@@ -98,47 +108,45 @@ contract LockDrop is Ownable, ReentrancyGuard {
         public
         view
         returns (
-            uint256 _maxCap,
             uint256 _startTime,
             uint256 _lockTime,
             uint256 _unlockTime,
-            uint256 _totalReward,
-            uint256 _totalAmount
+            uint256 _baseRewards,
+            uint256 _bonusRewards,
+            uint256 _totalAmount,
+            uint256 _totalBoostedAmount
         )
     {
-        _maxCap = MAX_CAP;
         _startTime = startTime;
         _lockTime = lockTime;
         _unlockTime = unlockTime;
-        _totalReward = TOTAL_REWARDS;
+        _baseRewards = BASE_REWARDS;
+        _bonusRewards = BONUS_REWARDS;
         _totalAmount = totalAmount;
+        _totalBoostedAmount = totalBoostedAmount;
     }
 
     // =============== USER FUNCTIONS ===============
 
-    /// @notice Deposited token will be add to Level Pool, then the LP is locked to this contract
+    /// @notice Deposit ERC20 token. Deposited token will be add to Level Pool, then the LP is locked to this contract
     function deposit(address _token, uint256 _amount, uint256 _minLpAmount, address _to)
         external
-        payable
         nonReentrant
+        onlyActive
     {
-        uint256 _now = block.timestamp;
-        require(lockTime > _now, "LockDrop::deposit: locked");
-        require(startTime <= _now, "LockDrop::deposit: not start");
-
-        uint256 lockAmount = addLiquidity(_token, _amount, _minLpAmount);
-        require(MAX_CAP >= totalAmount + lockAmount, "LockDrop::deposit: max cap exceeded");
-
-        uint256 boostedAmount = (lockTime - _now) * lockAmount;
-
-        UserInfo storage user = userInfo[_to];
-        user.boostedAmount += boostedAmount;
-        user.amount += lockAmount;
-
-        totalBoostedAmount += boostedAmount;
-        totalAmount += lockAmount;
-
+        uint256 lockAmount = _addLiquidity(_token, _amount, _minLpAmount);
+        _update(_to, lockAmount);
         emit Deposited(msg.sender, _to, _token, _amount, lockAmount);
+    }
+
+    /// @notice Deposit ETH token. Deposited token will be add to Level Pool, then the LP is locked to this contract
+    function depositETH(uint256 _minLpAmount, address _to) external payable nonReentrant onlyActive {
+        uint256 _amount = msg.value;
+        uint256 lockAmount = _addLiquidityETH(_amount, _minLpAmount);
+
+        _update(_to, lockAmount);
+
+        emit ETHDeposited(msg.sender, _to, _amount, lockAmount);
     }
 
     /// @notice withdraw LP token then stake to farm contract
@@ -200,24 +208,38 @@ contract LockDrop is Ownable, ReentrancyGuard {
 
     // ===============  INTERNAL ===============
 
-    function addLiquidity(address _token, uint256 _amount, uint256 _minLpAmount) internal returns (uint256) {
+    function _update(address _to, uint256 _lockAmount) internal {
+        uint256 _now = block.timestamp;
+        uint256 boostedAmount = (lockTime - _now) * _lockAmount;
+
+        UserInfo storage user = userInfo[_to];
+        user.boostedAmount += boostedAmount;
+        user.amount += _lockAmount;
+
+        totalBoostedAmount += boostedAmount;
+        totalAmount += _lockAmount;
+    }
+
+    function _addLiquidity(address _token, uint256 _amount, uint256 _minLpAmount) internal returns (uint256) {
         uint256 currentBalance = lp.balanceOf(address(this));
+        IERC20(_token).safeTransferFrom(msg.sender, address(this), _amount);
+        IERC20(_token).safeIncreaseAllowance(address(pool), _amount);
+        pool.addLiquidity(address(lp), _token, _amount, _minLpAmount, address(this));
+        return lp.balanceOf(address(this)) - currentBalance;
+    }
 
-        if (_token != UniERC20.ETH) {
-            IERC20(_token).safeTransferFrom(msg.sender, address(this), _amount);
-            IERC20(_token).safeIncreaseAllowance(address(pool), _amount);
-            pool.addLiquidity(address(lp), _token, _amount, _minLpAmount, address(this));
-        } else {
-            require(msg.value == _amount, "LockDrop::deposit: invalid transfer in amount");
-            pool.addLiquidity{value: _amount}(address(lp), _token, _amount, _minLpAmount, address(this));
-        }
-
+    function _addLiquidityETH(uint256 _amount, uint256 _minLpAmount) internal returns (uint256) {
+        uint256 currentBalance = lp.balanceOf(address(this));
+        weth.deposit{value: _amount}();
+        weth.safeIncreaseAllowance(address(pool), _amount);
+        pool.addLiquidity(address(lp), address(weth), _amount, _minLpAmount, address(this));
         return lp.balanceOf(address(this)) - currentBalance;
     }
 
     // ===============  EVENTS ===============
     event EmergencySet(bool enableEmergency);
     event Deposited(address indexed sender, address indexed to, address token, uint256 amount, uint256 lockAmount);
+    event ETHDeposited(address indexed sender, address indexed to, uint256 amount, uint256 lockAmount);
     event EmergencyWithdrawn(address indexed sender, address indexed to);
     event Withdrawn(address indexed sender, address indexed to, uint256 amount, uint256 rewards);
     event ClaimRewards(address indexed sender, address indexed to, uint256 rewards);

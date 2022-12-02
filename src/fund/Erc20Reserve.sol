@@ -13,7 +13,7 @@ import "../interfaces/ITokenReserve.sol";
 contract Erc20Reserve is Ownable, ITokenReserve {
     using SafeERC20 for IERC20;
 
-    IERC20 private immutable TOKEN;
+    IERC20 public immutable TOKEN;
 
     mapping(address => bool) public isDistributor;
     address[] private allDistributors;

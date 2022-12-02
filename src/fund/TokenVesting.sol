@@ -29,7 +29,7 @@ abstract contract TokenVesting {
         return _claimable();
     }
 
-    function claimVested(uint256 _amount, address _recipient) external virtual {
+    function _claimVested(uint256 _amount, address _recipient) internal {
         if (_amount == 0) {
             revert InvalidAmount();
         }

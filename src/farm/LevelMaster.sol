@@ -10,15 +10,19 @@ import {ReentrancyGuard} from "openzeppelin/security/ReentrancyGuard.sol";
 import {Ownable} from "openzeppelin/access/Ownable.sol";
 import {IPool} from "../interfaces/IPool.sol";
 import {ILPToken} from "../interfaces/ILPToken.sol";
-import {UniERC20} from "../lib/UniERC20.sol";
+import {IWETH} from "../interfaces/IWETH.sol";
 import "../interfaces/IRewarder.sol";
 import "../interfaces/ITokenReserve.sol";
 import "../interfaces/ILevelStake.sol";
+
 
 /// @title LevelMaster
 /// Inspired by Sushiswap's MinichefV2
 contract LevelMaster is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
+    using SafeERC20 for IWETH;
+
+    uint256 constant private MAX_REWARD_PER_SECOND = 1 ether;
 
     /// @notice Info of each MCV2 user.
     /// `amount` LP token amount the user has provided.
@@ -51,6 +55,7 @@ contract LevelMaster is Ownable, ReentrancyGuard {
     IRewarder[] public rewarder;
 
     IPool public immutable levelPool;
+    IWETH public immutable weth;
 
     /// @notice Info of each user that stakes LP tokens.
     mapping(uint256 => mapping(address => UserInfo)) public userInfo;
@@ -64,48 +69,19 @@ contract LevelMaster is Ownable, ReentrancyGuard {
     uint256 public rewardPerSecond;
     uint256 private constant ACC_REWARD_PRECISION = 1e12;
 
-    event Deposit(
-        address indexed user,
-        uint256 indexed pid,
-        uint256 amount,
-        address indexed to
-    );
-    event Withdraw(
-        address indexed user,
-        uint256 indexed pid,
-        uint256 amount,
-        address indexed to
-    );
-    event EmergencyWithdraw(
-        address indexed user,
-        uint256 indexed pid,
-        uint256 amount,
-        address indexed to
-    );
+    event Deposit(address indexed user, uint256 indexed pid, uint256 amount, address indexed to);
+    event Withdraw(address indexed user, uint256 indexed pid, uint256 amount, address indexed to);
+    event EmergencyWithdraw(address indexed user, uint256 indexed pid, uint256 amount, address indexed to);
     event Harvest(address indexed user, uint256 indexed pid, uint256 amount);
-    event LogPoolAddition(
-        uint256 indexed pid,
-        uint256 allocPoint,
-        IERC20 indexed lpToken,
-        IRewarder indexed rewarder
-    );
-    event LogSetPool(
-        uint256 indexed pid,
-        uint256 allocPoint,
-        IRewarder indexed rewarder,
-        bool overwrite
-    );
-    event LogUpdatePool(
-        uint256 indexed pid,
-        uint64 lastRewardTime,
-        uint256 lpSupply,
-        uint256 accRewardPerShare
-    );
+    event LogPoolAddition(uint256 indexed pid, uint256 allocPoint, IERC20 indexed lpToken, IRewarder indexed rewarder);
+    event LogSetPool(uint256 indexed pid, uint256 allocPoint, IRewarder indexed rewarder, bool overwrite);
+    event LogUpdatePool(uint256 indexed pid, uint64 lastRewardTime, uint256 lpSupply, uint256 accRewardPerShare);
     event LogRewardPerSecond(uint256 rewardPerSecond);
 
-    constructor(address _reserve, address _levelPool) {
+    constructor(address _reserve, address _levelPool, address _weth) {
         LEVEL_RESERVE = ITokenReserve(_reserve);
         levelPool = IPool(_levelPool);
+        weth = IWETH(_weth);
     }
 
     /// @notice Returns the number of MCV2 pools.
@@ -118,26 +94,17 @@ contract LevelMaster is Ownable, ReentrancyGuard {
     /// @param allocPoint AP of the new pool.
     /// @param _lpToken Address of the LP ERC-20 token.
     /// @param _rewarder Address of the rewarder delegate.
-    function add(uint256 allocPoint, IERC20 _lpToken, IRewarder _rewarder)
-        public
-        onlyOwner
-    {
+    function add(uint256 allocPoint, IERC20 _lpToken, IRewarder _rewarder) public onlyOwner {
         require(addedTokens[address(_lpToken)] == false, "Token already added");
         totalAllocPoint = totalAllocPoint + allocPoint;
         lpToken.push(_lpToken);
         rewarder.push(_rewarder);
 
         poolInfo.push(
-            PoolInfo({
-                allocPoint: uint64(allocPoint),
-                lastRewardTime: uint64(block.timestamp),
-                accRewardPerShare: 0
-            })
+            PoolInfo({allocPoint: uint64(allocPoint), lastRewardTime: uint64(block.timestamp), accRewardPerShare: 0})
         );
         addedTokens[address(_lpToken)] = true;
-        emit LogPoolAddition(
-            lpToken.length - 1, allocPoint, _lpToken, _rewarder
-            );
+        emit LogPoolAddition(lpToken.length - 1, allocPoint, _lpToken, _rewarder);
     }
 
     /// @notice Update the given pool's REWARD allocation point and `IRewarder` contract. Can only be called by the owner.
@@ -145,29 +112,19 @@ contract LevelMaster is Ownable, ReentrancyGuard {
     /// @param _allocPoint New AP of the pool.
     /// @param _rewarder Address of the rewarder delegate.
     /// @param overwrite True if _rewarder should be `set`. Otherwise `_rewarder` is ignored.
-    function set(
-        uint256 _pid,
-        uint256 _allocPoint,
-        IRewarder _rewarder,
-        bool overwrite
-    )
-        public
-        onlyOwner
-    {
-        totalAllocPoint =
-            totalAllocPoint - poolInfo[_pid].allocPoint + _allocPoint;
+    function set(uint256 _pid, uint256 _allocPoint, IRewarder _rewarder, bool overwrite) public onlyOwner {
+        totalAllocPoint = totalAllocPoint - poolInfo[_pid].allocPoint + _allocPoint;
         poolInfo[_pid].allocPoint = uint64(_allocPoint);
         if (overwrite) {
             rewarder[_pid] = _rewarder;
         }
-        emit LogSetPool(
-            _pid, _allocPoint, overwrite ? _rewarder : rewarder[_pid], overwrite
-            );
+        emit LogSetPool(_pid, _allocPoint, overwrite ? _rewarder : rewarder[_pid], overwrite);
     }
 
     /// @notice Sets the reward per second to be distributed. Can only be called by the owner.
     /// @param _rewardPerSecond The amount of LEvEL to be distributed per second.
     function setRewardPerSecond(uint256 _rewardPerSecond) public onlyOwner {
+        require(_rewardPerSecond <= MAX_REWARD_PER_SECOND, "> MAX_REWARD_PER_SECOND");
         rewardPerSecond = _rewardPerSecond;
         emit LogRewardPerSecond(_rewardPerSecond);
     }
@@ -176,26 +133,17 @@ contract LevelMaster is Ownable, ReentrancyGuard {
     /// @param _pid The index of the pool. See `poolInfo`.
     /// @param _user Address of user.
     /// @return pending LEVEL reward for a given user.
-    function pendingReward(uint256 _pid, address _user)
-        external
-        view
-        returns (uint256 pending)
-    {
+    function pendingReward(uint256 _pid, address _user) external view returns (uint256 pending) {
         PoolInfo memory pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][_user];
         uint256 accRewardPerShare = pool.accRewardPerShare;
         uint256 lpSupply = lpToken[_pid].balanceOf(address(this));
         if (block.timestamp > pool.lastRewardTime && lpSupply != 0) {
             uint256 time = block.timestamp - pool.lastRewardTime;
-            uint256 reward =
-                time * rewardPerSecond * pool.allocPoint / totalAllocPoint;
-            accRewardPerShare =
-                accRewardPerShare + (reward * ACC_REWARD_PRECISION / lpSupply);
+            accRewardPerShare = accRewardPerShare
+                + (time * rewardPerSecond * pool.allocPoint * ACC_REWARD_PRECISION / totalAllocPoint / lpSupply);
         }
-        pending = uint256(
-            int256(user.amount * accRewardPerShare / ACC_REWARD_PRECISION)
-                - user.rewardDebt
-        );
+        pending = uint256(int256(user.amount * accRewardPerShare / ACC_REWARD_PRECISION) - user.rewardDebt);
     }
 
     /// @notice Update reward variables for all pools. Be careful of gas spending!
@@ -216,16 +164,12 @@ contract LevelMaster is Ownable, ReentrancyGuard {
             uint256 lpSupply = lpToken[pid].balanceOf(address(this));
             if (lpSupply > 0) {
                 uint256 time = block.timestamp - pool.lastRewardTime;
-                uint256 reward =
-                    time * rewardPerSecond * pool.allocPoint / totalAllocPoint;
                 pool.accRewardPerShare = pool.accRewardPerShare
-                    + uint128(reward * ACC_REWARD_PRECISION / lpSupply);
+                    + uint128(time * rewardPerSecond * pool.allocPoint * ACC_REWARD_PRECISION / totalAllocPoint / lpSupply);
             }
             pool.lastRewardTime = uint64(block.timestamp);
             poolInfo[pid] = pool;
-            emit LogUpdatePool(
-                pid, pool.lastRewardTime, lpSupply, pool.accRewardPerShare
-                );
+            emit LogUpdatePool(pid, pool.lastRewardTime, lpSupply, pool.accRewardPerShare);
         }
     }
 
@@ -236,7 +180,6 @@ contract LevelMaster is Ownable, ReentrancyGuard {
     function deposit(uint256 pid, uint256 amount, address to) public {
         _deposit(pid, amount, to);
         lpToken[pid].safeTransferFrom(msg.sender, address(this), amount);
-        emit Deposit(msg.sender, pid, amount, to);
     }
 
     /// @notice Withdraw LP tokens from MCV2.
@@ -248,8 +191,7 @@ contract LevelMaster is Ownable, ReentrancyGuard {
         UserInfo storage user = userInfo[pid][msg.sender];
 
         // Effects
-        user.rewardDebt = user.rewardDebt
-            - int256(amount * pool.accRewardPerShare / ACC_REWARD_PRECISION);
+        user.rewardDebt = user.rewardDebt - int256(amount * pool.accRewardPerShare / ACC_REWARD_PRECISION);
         user.amount = user.amount - amount;
 
         // Interactions
@@ -269,21 +211,21 @@ contract LevelMaster is Ownable, ReentrancyGuard {
     function harvest(uint256 pid, address to) public {
         PoolInfo memory pool = updatePool(pid);
         UserInfo storage user = userInfo[pid][msg.sender];
-        int256 accumulatedReward =
-            int256(user.amount * pool.accRewardPerShare / ACC_REWARD_PRECISION);
+        int256 accumulatedReward = int256(user.amount * pool.accRewardPerShare / ACC_REWARD_PRECISION);
         uint256 _pendingReward = uint256(accumulatedReward - user.rewardDebt);
 
         // Effects
         user.rewardDebt = accumulatedReward;
 
         // Interactions
-        if (_pendingReward != 0) {
+        if (_pendingReward > 0) {
             LEVEL_RESERVE.requestTransfer(to, _pendingReward);
-        }
 
-        IRewarder _rewarder = rewarder[pid];
-        if (address(_rewarder) != address(0)) {
-            _rewarder.onReward(pid, msg.sender, to, _pendingReward, user.amount);
+            IRewarder _rewarder = rewarder[pid];
+            if (address(_rewarder) != address(0)) {
+                _rewarder.onReward(pid, msg.sender, to, _pendingReward, user.amount);
+            }
+            emit Harvest(msg.sender, pid, _pendingReward);
         }
 
         emit Harvest(msg.sender, pid, _pendingReward);
@@ -299,64 +241,62 @@ contract LevelMaster is Ownable, ReentrancyGuard {
     /// @param pid The index of the pool. See `poolInfo`.
     /// @param amount LP token amount to withdraw.
     /// @param to Receiver of the LP tokens and REWARD rewards.
-    function withdrawAndHarvest(uint256 pid, uint256 amount, address to)
-        public
-    {
+    function withdrawAndHarvest(uint256 pid, uint256 amount, address to) public {
         _withdrawAndHarvest(pid, amount, to);
         lpToken[pid].safeTransfer(to, amount);
     }
 
-    function addLiquidity(
-        uint256 pid,
-        address assetToken,
-        uint256 assetAmount,
-        uint256 minLpAmount,
-        address to
-    )
+    function addLiquidity(uint256 pid, address assetToken, uint256 assetAmount, uint256 minLpAmount, address to)
         external
-        payable
         nonReentrant
     {
         require(assetAmount > 0, "Invalid input");
+
         address tranche = address(lpToken[pid]);
-        uint256 balanceLpTokenBefore =
-            ILPToken(tranche).balanceOf(address(this));
-        if (assetToken != UniERC20.ETH) {
-            IERC20(assetToken).safeTransferFrom(
-                msg.sender, address(this), assetAmount
-            );
-            IERC20(assetToken).approve(address(levelPool), 0);
-            IERC20(assetToken).approve(address(levelPool), assetAmount);
-            levelPool.addLiquidity(
-                tranche, assetToken, assetAmount, minLpAmount, address(this)
-            );
-        } else {
-            require(msg.value == assetAmount, "Invalid amount transfer");
-            levelPool.addLiquidity{value: assetAmount}(
-                tranche, assetToken, assetAmount, minLpAmount, address(this)
-            );
-        }
-        uint256 balanceLpTokenAfter = ILPToken(tranche).balanceOf(address(this));
-        uint256 lpAmount = balanceLpTokenAfter - balanceLpTokenBefore;
-        require(lpAmount > 0, "Invalid LP amount");
+        uint256 balanceLpTokenBefore = ILPToken(tranche).balanceOf(address(this));
+        IERC20(assetToken).safeTransferFrom(msg.sender, address(this), assetAmount);
+        IERC20(assetToken).safeIncreaseAllowance(address(levelPool), assetAmount);
+        levelPool.addLiquidity(tranche, assetToken, assetAmount, minLpAmount, address(this));
+        uint256 lpAmount = ILPToken(tranche).balanceOf(address(this)) - balanceLpTokenBefore;
+
+
         _deposit(pid, lpAmount, to);
     }
 
-    function removeLiquidity(
-        uint256 pid,
-        uint256 lpAmount,
-        address toToken,
-        uint256 minOut,
-        address to
-    )
+    function addLiquidityETH(uint256 pid, uint256 minLpAmount, address to) external payable nonReentrant {
+        uint256 _amountIn = msg.value;
+        require(_amountIn > 0, "Invalid input");
+
+        address tranche = address(lpToken[pid]);
+        uint256 balanceLpTokenBefore = ILPToken(tranche).balanceOf(address(this));
+        weth.deposit{value: _amountIn}();
+        weth.safeIncreaseAllowance(address(levelPool), _amountIn);
+        levelPool.addLiquidity(tranche, address(weth), _amountIn, minLpAmount, address(this));
+        uint256 lpAmount = ILPToken(tranche).balanceOf(address(this)) - balanceLpTokenBefore;
+
+        _deposit(pid, lpAmount, to);
+    }
+
+    function removeLiquidity(uint256 pid, uint256 lpAmount, address toToken, uint256 minOut, address to)
         external
         nonReentrant
     {
         _withdrawAndHarvest(pid, lpAmount, to);
-        address tranche = address(lpToken[pid]);
-        IERC20(tranche).approve(address(levelPool), 0);
-        IERC20(tranche).approve(address(levelPool), lpAmount);
-        levelPool.removeLiquidity(tranche, toToken, lpAmount, minOut, to);
+        IERC20 tranche = lpToken[pid];
+        tranche.safeIncreaseAllowance(address(levelPool), lpAmount);
+        levelPool.removeLiquidity(address(tranche), toToken, lpAmount, minOut, to);
+    }
+
+    function removeLiquidityETH(uint256 pid, uint256 lpAmount, uint256 minOut, address to) external nonReentrant {
+        _withdrawAndHarvest(pid, lpAmount, to);
+
+        IERC20 tranche = lpToken[pid];
+        tranche.safeIncreaseAllowance(address(levelPool), lpAmount);
+        uint256 balanceBefore = weth.balanceOf(address(this));
+        levelPool.removeLiquidity(address(tranche), address(weth), lpAmount, minOut, address(this));
+        uint256 received = weth.balanceOf(address(this)) - balanceBefore;
+        weth.withdraw(received);
+        _safeTransferETH(to, received);
     }
 
     /// @notice Withdraw without caring about rewards. EMERGENCY ONLY.
@@ -378,15 +318,15 @@ contract LevelMaster is Ownable, ReentrancyGuard {
         emit EmergencyWithdraw(msg.sender, pid, amount, to);
     }
 
-    //internal
+    // internal
     function _deposit(uint256 pid, uint256 amount, address to) internal {
+        require(amount > 0, "Invalid deposit amount");
         PoolInfo memory pool = updatePool(pid);
         UserInfo storage user = userInfo[pid][to];
 
         // Effects
         user.amount = user.amount + amount;
-        user.rewardDebt = user.rewardDebt
-            + int256(amount * pool.accRewardPerShare / ACC_REWARD_PRECISION);
+        user.rewardDebt = user.rewardDebt + int256(amount * pool.accRewardPerShare / ACC_REWARD_PRECISION);
 
         // Interactions
         IRewarder _rewarder = rewarder[pid];
@@ -396,28 +336,34 @@ contract LevelMaster is Ownable, ReentrancyGuard {
         emit Deposit(msg.sender, pid, amount, to);
     }
 
-    function _withdrawAndHarvest(uint256 pid, uint256 amount, address to)
-        internal
-    {
+    function _withdrawAndHarvest(uint256 pid, uint256 amount, address to) internal {
         PoolInfo memory pool = updatePool(pid);
         UserInfo storage user = userInfo[pid][msg.sender];
-        int256 accumulatedReward =
-            int256(user.amount * pool.accRewardPerShare / ACC_REWARD_PRECISION);
+        int256 accumulatedReward = int256(user.amount * pool.accRewardPerShare / ACC_REWARD_PRECISION);
         uint256 _pendingReward = uint256(accumulatedReward - user.rewardDebt);
 
         // Effects
-        user.rewardDebt = accumulatedReward
-            - int256(amount * pool.accRewardPerShare / ACC_REWARD_PRECISION);
+        user.rewardDebt = accumulatedReward - int256(amount * pool.accRewardPerShare / ACC_REWARD_PRECISION);
         user.amount = user.amount - amount;
 
         // Interactions
-        LEVEL_RESERVE.requestTransfer(to, _pendingReward);
+        if (_pendingReward > 0) {
+            LEVEL_RESERVE.requestTransfer(to, _pendingReward);
+            emit Harvest(msg.sender, pid, _pendingReward);
+        }
 
         IRewarder _rewarder = rewarder[pid];
         if (address(_rewarder) != address(0)) {
             _rewarder.onReward(pid, msg.sender, to, _pendingReward, user.amount);
         }
         emit Withdraw(msg.sender, pid, amount, to);
-        emit Harvest(msg.sender, pid, _pendingReward);
     }
+
+    function _safeTransferETH(address to, uint256 amount) internal {
+        // solhint-disable-next-line avoid-low-level-calls
+        (bool success,) = to.call{value: amount}(new bytes(0));
+        require(success, "ETH_TRANSFER_FAILED");
+    }
+
+    receive() external payable {}
 }

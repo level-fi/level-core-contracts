@@ -7,7 +7,6 @@ import {SafeERC20} from "openzeppelin/token/ERC20/utils/SafeERC20.sol";
 import {OwnableUpgradeable} from "openzeppelin-upgradeable/access/OwnableUpgradeable.sol";
 import {Initializable} from "openzeppelin-upgradeable/proxy/utils/Initializable.sol";
 import {ILevelStake} from "../interfaces/ILevelStake.sol";
-import "forge-std/console.sol";
 
 /// @title Team staking fund
 /// @author Level

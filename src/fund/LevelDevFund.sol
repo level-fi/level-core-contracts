@@ -5,7 +5,7 @@ pragma solidity 0.8.15;
 import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
 import {SafeERC20} from "openzeppelin/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "openzeppelin/access/Ownable.sol";
-import {Initializable} from "openzeppelin/proxy/utils/Initializable.sol";
+import {Initializable} from "openzeppelin-upgradeable/proxy/utils/Initializable.sol";
 import {TokenVesting} from "./TokenVesting.sol";
 
 contract LevelDevFund is Initializable, Ownable, TokenVesting {
@@ -23,6 +23,10 @@ contract LevelDevFund is Initializable, Ownable, TokenVesting {
 
     function _transferOut(address _recipient, uint256 _amount) internal override {
         LVL.safeTransfer(_recipient, _amount);
+    }
+
+    function claimVested(uint256 _amount, address _recipient) external onlyOwner {
+        _claimVested(_amount, _recipient);
     }
 
     error InvalidAddress();

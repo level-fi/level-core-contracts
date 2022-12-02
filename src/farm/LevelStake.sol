@@ -5,7 +5,6 @@ import {SafeERC20, IERC20} from "openzeppelin/token/ERC20/utils/SafeERC20.sol";
 import {ERC20} from "openzeppelin/token/ERC20/ERC20.sol";
 import {OwnableUpgradeable} from "openzeppelin-upgradeable/access/OwnableUpgradeable.sol";
 import {Initializable} from "openzeppelin-upgradeable/proxy/utils/Initializable.sol";
-import {ITransferHook} from "../interfaces/ITransferHook.sol";
 import {ILevelStake} from "../interfaces/ILevelStake.sol";
 import {ITokenReserve} from "../interfaces/ITokenReserve.sol";
 
@@ -16,6 +15,8 @@ import {ITokenReserve} from "../interfaces/ITokenReserve.sol";
  */
 contract LevelStake is Initializable, OwnableUpgradeable, ILevelStake {
     using SafeERC20 for IERC20;
+
+    uint256 private constant MAX_REWARD_PER_SECOND = 1 ether;
 
     struct UserInfo {
         uint256 amount;
@@ -48,11 +49,12 @@ contract LevelStake is Initializable, OwnableUpgradeable, ILevelStake {
         uint256 _unstakeWindow,
         uint256 _rewardPerSecond,
         address _lgoReserve
-    )
-        external
-        initializer
-    {
+    ) external initializer {
         __Ownable_init();
+        require(_rewardPerSecond <= MAX_REWARD_PER_SECOND, "> MAX_REWARD_PER_SECOND");
+        require(_lvl != address(0), "Invalid LVL address");
+        require(_lgo != address(0), "Invalid LVL address");
+        require(_lgoReserve != address(0), "Invalid LGO reserve address");
         LVL = IERC20(_lvl);
         LGO = IERC20(_lgo);
         cooldownSeconds = _cooldownSeconds;
@@ -100,7 +102,7 @@ contract LevelStake is Initializable, OwnableUpgradeable, ILevelStake {
             }
         }
 
-        user.cooldowns = getNextCooldownTimestamp(0, _amount, _to, user.amount);
+        user.cooldowns = getNextCooldownTimestamp(_amount, _to, user.amount);
         user.amount += _amount;
         user.rewardDebt = (user.amount * accRewardPerShare) / ACC_REWARD_PRECISION;
 
@@ -187,19 +189,13 @@ contract LevelStake is Initializable, OwnableUpgradeable, ILevelStake {
      * # The sender timestamp is expired
      * # The sender has a "worse" timestamp
      * - If the receiver's cooldown timestamp expired (too old), the next is 0
-     * @param _fromCooldownTimestamp Cooldown timestamp of the sender
      * @param _amountToReceive Amount
      * @param _to Address of the recipient
      * @param _toBalance Current balance of the receiver
      * @return The new cooldown timestamp
      *
      */
-    function getNextCooldownTimestamp(
-        uint256 _fromCooldownTimestamp,
-        uint256 _amountToReceive,
-        address _to,
-        uint256 _toBalance
-    )
+    function getNextCooldownTimestamp(uint256 _amountToReceive, address _to, uint256 _toBalance)
         public
         view
         returns (uint256)
@@ -207,6 +203,7 @@ contract LevelStake is Initializable, OwnableUpgradeable, ILevelStake {
         UserInfo storage user = userInfo[_to];
 
         uint256 toCooldownTimestamp = user.cooldowns;
+
         if (toCooldownTimestamp == 0) {
             return 0;
         }
@@ -216,13 +213,12 @@ contract LevelStake is Initializable, OwnableUpgradeable, ILevelStake {
         if (minimalValidCooldownTimestamp > toCooldownTimestamp) {
             toCooldownTimestamp = 0;
         } else {
-            _fromCooldownTimestamp =
-                (minimalValidCooldownTimestamp > _fromCooldownTimestamp) ? block.timestamp : _fromCooldownTimestamp;
+            uint256 fromCooldownTimestamp = block.timestamp;
 
-            if (_fromCooldownTimestamp < toCooldownTimestamp) {
+            if (fromCooldownTimestamp < toCooldownTimestamp) {
                 return toCooldownTimestamp;
             } else {
-                toCooldownTimestamp = (_amountToReceive * _fromCooldownTimestamp + (_toBalance * toCooldownTimestamp))
+                toCooldownTimestamp = (_amountToReceive * fromCooldownTimestamp + (_toBalance * toCooldownTimestamp))
                     / (_amountToReceive + _toBalance);
             }
         }
@@ -234,6 +230,7 @@ contract LevelStake is Initializable, OwnableUpgradeable, ILevelStake {
     /// @notice Sets the reward per second to be distributed. Can only be called by the owner.
     /// @param _rewardPerSecond The amount of LGO to be distributed per second.
     function setRewardPerSecond(uint256 _rewardPerSecond) public onlyOwner {
+        require(_rewardPerSecond <= MAX_REWARD_PER_SECOND, "> MAX_REWARD_PER_SECOND");
         update();
         rewardPerSecond = _rewardPerSecond;
         emit RewardPerSecondUpdated(_rewardPerSecond);
