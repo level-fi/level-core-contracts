@@ -15,14 +15,14 @@ import "../interfaces/IRewarder.sol";
 import "../interfaces/ITokenReserve.sol";
 import "../interfaces/ILevelStake.sol";
 
-
 /// @title LevelMaster
 /// Inspired by Sushiswap's MinichefV2
 contract LevelMaster is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
     using SafeERC20 for IWETH;
 
-    uint256 constant private MAX_REWARD_PER_SECOND = 1 ether;
+    uint256 private constant MAX_REWARD_PER_SECOND = 1 ether;
+    uint256 private constant MAX_ALLOCT_POINT = 1e6;
 
     /// @notice Info of each MCV2 user.
     /// `amount` LP token amount the user has provided.
@@ -96,6 +96,7 @@ contract LevelMaster is Ownable, ReentrancyGuard {
     /// @param _rewarder Address of the rewarder delegate.
     function add(uint256 allocPoint, IERC20 _lpToken, IRewarder _rewarder) public onlyOwner {
         require(addedTokens[address(_lpToken)] == false, "Token already added");
+        require(allocPoint <= MAX_ALLOCT_POINT, "Alloc point too high");
         totalAllocPoint = totalAllocPoint + allocPoint;
         lpToken.push(_lpToken);
         rewarder.push(_rewarder);
@@ -113,6 +114,7 @@ contract LevelMaster is Ownable, ReentrancyGuard {
     /// @param _rewarder Address of the rewarder delegate.
     /// @param overwrite True if _rewarder should be `set`. Otherwise `_rewarder` is ignored.
     function set(uint256 _pid, uint256 _allocPoint, IRewarder _rewarder, bool overwrite) public onlyOwner {
+        require(_allocPoint <= MAX_ALLOCT_POINT, "Alloc point too high");
         totalAllocPoint = totalAllocPoint - poolInfo[_pid].allocPoint + _allocPoint;
         poolInfo[_pid].allocPoint = uint64(_allocPoint);
         if (overwrite) {
@@ -162,7 +164,7 @@ contract LevelMaster is Ownable, ReentrancyGuard {
         pool = poolInfo[pid];
         if (block.timestamp > pool.lastRewardTime) {
             uint256 lpSupply = lpToken[pid].balanceOf(address(this));
-            if (lpSupply > 0) {
+            if (lpSupply != 0) {
                 uint256 time = block.timestamp - pool.lastRewardTime;
                 pool.accRewardPerShare = pool.accRewardPerShare
                     + uint128(time * rewardPerSecond * pool.allocPoint * ACC_REWARD_PRECISION / totalAllocPoint / lpSupply);
@@ -218,7 +220,7 @@ contract LevelMaster is Ownable, ReentrancyGuard {
         user.rewardDebt = accumulatedReward;
 
         // Interactions
-        if (_pendingReward > 0) {
+        if (_pendingReward != 0) {
             LEVEL_RESERVE.requestTransfer(to, _pendingReward);
 
             IRewarder _rewarder = rewarder[pid];
@@ -227,8 +229,6 @@ contract LevelMaster is Ownable, ReentrancyGuard {
             }
             emit Harvest(msg.sender, pid, _pendingReward);
         }
-
-        emit Harvest(msg.sender, pid, _pendingReward);
     }
 
     function harvestAll(address to) external {
@@ -250,7 +250,7 @@ contract LevelMaster is Ownable, ReentrancyGuard {
         external
         nonReentrant
     {
-        require(assetAmount > 0, "Invalid input");
+        require(assetAmount != 0, "Invalid input");
 
         address tranche = address(lpToken[pid]);
         uint256 balanceLpTokenBefore = ILPToken(tranche).balanceOf(address(this));
@@ -259,13 +259,12 @@ contract LevelMaster is Ownable, ReentrancyGuard {
         levelPool.addLiquidity(tranche, assetToken, assetAmount, minLpAmount, address(this));
         uint256 lpAmount = ILPToken(tranche).balanceOf(address(this)) - balanceLpTokenBefore;
 
-
         _deposit(pid, lpAmount, to);
     }
 
     function addLiquidityETH(uint256 pid, uint256 minLpAmount, address to) external payable nonReentrant {
         uint256 _amountIn = msg.value;
-        require(_amountIn > 0, "Invalid input");
+        require(_amountIn != 0, "Invalid input");
 
         address tranche = address(lpToken[pid]);
         uint256 balanceLpTokenBefore = ILPToken(tranche).balanceOf(address(this));
@@ -320,7 +319,7 @@ contract LevelMaster is Ownable, ReentrancyGuard {
 
     // internal
     function _deposit(uint256 pid, uint256 amount, address to) internal {
-        require(amount > 0, "Invalid deposit amount");
+        require(amount != 0, "Invalid deposit amount");
         PoolInfo memory pool = updatePool(pid);
         UserInfo storage user = userInfo[pid][to];
 
@@ -347,7 +346,7 @@ contract LevelMaster is Ownable, ReentrancyGuard {
         user.amount = user.amount - amount;
 
         // Interactions
-        if (_pendingReward > 0) {
+        if (_pendingReward != 0) {
             LEVEL_RESERVE.requestTransfer(to, _pendingReward);
             emit Harvest(msg.sender, pid, _pendingReward);
         }
