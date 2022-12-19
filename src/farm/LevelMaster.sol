@@ -12,8 +12,6 @@ import {IPool} from "../interfaces/IPool.sol";
 import {ILPToken} from "../interfaces/ILPToken.sol";
 import {IWETH} from "../interfaces/IWETH.sol";
 import "../interfaces/IRewarder.sol";
-import "../interfaces/ITokenReserve.sol";
-import "../interfaces/ILevelStake.sol";
 
 /// @title LevelMaster
 /// Inspired by Sushiswap's MinichefV2
@@ -41,10 +39,6 @@ contract LevelMaster is Ownable, ReentrancyGuard {
         uint64 allocPoint;
     }
 
-    /// @notice Address of LEVEL contract.
-    // IERC20 public immutable LEVEL;
-    ITokenReserve public immutable LEVEL_RESERVE;
-
     /// @notice Info of each MCV2 pool.
     PoolInfo[] public poolInfo;
 
@@ -56,6 +50,7 @@ contract LevelMaster is Ownable, ReentrancyGuard {
 
     IPool public immutable levelPool;
     IWETH public immutable weth;
+    IERC20 public rewardToken;
 
     /// @notice Info of each user that stakes LP tokens.
     mapping(uint256 => mapping(address => UserInfo)) public userInfo;
@@ -77,9 +72,9 @@ contract LevelMaster is Ownable, ReentrancyGuard {
     event LogSetPool(uint256 indexed pid, uint256 allocPoint, IRewarder indexed rewarder, bool overwrite);
     event LogUpdatePool(uint256 indexed pid, uint64 lastRewardTime, uint256 lpSupply, uint256 accRewardPerShare);
     event LogRewardPerSecond(uint256 rewardPerSecond);
+    event LogSetRewardToken(address token);
 
-    constructor(address _reserve, address _levelPool, address _weth) {
-        LEVEL_RESERVE = ITokenReserve(_reserve);
+    constructor(address _levelPool, address _weth) {
         levelPool = IPool(_levelPool);
         weth = IWETH(_weth);
     }
@@ -221,7 +216,7 @@ contract LevelMaster is Ownable, ReentrancyGuard {
 
         // Interactions
         if (_pendingReward != 0) {
-            LEVEL_RESERVE.requestTransfer(to, _pendingReward);
+            _safeTransferReward(to, _pendingReward);
 
             IRewarder _rewarder = rewarder[pid];
             if (address(_rewarder) != address(0)) {
@@ -347,7 +342,7 @@ contract LevelMaster is Ownable, ReentrancyGuard {
 
         // Interactions
         if (_pendingReward != 0) {
-            LEVEL_RESERVE.requestTransfer(to, _pendingReward);
+            _safeTransferReward(to, _pendingReward);
             emit Harvest(msg.sender, pid, _pendingReward);
         }
 
@@ -358,10 +353,27 @@ contract LevelMaster is Ownable, ReentrancyGuard {
         emit Withdraw(msg.sender, pid, amount, to);
     }
 
+    function setRewardToken(address _rewardToken) external onlyOwner {
+        require(rewardToken == IERC20(address(0)), "LevelMaster:: reward token already set");
+        rewardToken = IERC20(_rewardToken);
+        emit LogSetRewardToken(_rewardToken);
+    }
+
     function _safeTransferETH(address to, uint256 amount) internal {
         // solhint-disable-next-line avoid-low-level-calls
         (bool success,) = to.call{value: amount}(new bytes(0));
         require(success, "ETH_TRANSFER_FAILED");
+    }
+
+    // Safe reward transfer function, just in case if rounding error causes pool to not have enough reward.
+    function _safeTransferReward(address _to, uint256 _amount) internal {
+        require(rewardToken != IERC20(address(0)), "LevelMaster::_safeTransferReward: reward not set");
+        uint256 rewardBalance = rewardToken.balanceOf(address(this));
+        if (_amount > rewardBalance) {
+            rewardToken.transfer(_to, rewardBalance);
+        } else {
+            rewardToken.transfer(_to, _amount);
+        }
     }
 
     receive() external payable {}

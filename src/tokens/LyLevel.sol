@@ -5,8 +5,6 @@ pragma solidity 0.8.15;
 import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
 import {Initializable} from "openzeppelin-upgradeable/proxy/utils/Initializable.sol";
 import {OwnableUpgradeable} from "openzeppelin-upgradeable/access/OwnableUpgradeable.sol";
-import {ReentrancyGuard} from "openzeppelin/security/ReentrancyGuard.sol";
-import {ITokenReserve} from "../interfaces/ITokenReserve.sol";
 
 contract LyLevel is Initializable, OwnableUpgradeable, IERC20 {
     struct RedeemProgramInfo {
@@ -15,7 +13,7 @@ contract LyLevel is Initializable, OwnableUpgradeable, IERC20 {
         uint256 allocatedTime;
     }
 
-    string public constant name = "Level Finance loyalty token";
+    string public constant name = "Level loyalty token";
 
     string public constant symbol = "lyLVL";
 
@@ -25,7 +23,7 @@ contract LyLevel is Initializable, OwnableUpgradeable, IERC20 {
 
     address public minter;
 
-    ITokenReserve public rewardFund;
+    IERC20 public rewardToken;
 
     uint256 public currentBatchId;
 
@@ -38,6 +36,8 @@ contract LyLevel is Initializable, OwnableUpgradeable, IERC20 {
     mapping(uint256 => mapping(address => uint256)) public userClaimed;
 
     mapping(uint256 => uint256) private totalSupply_;
+
+    uint256 public totalUnclaimReward;
 
     function initialize() external initializer {
         __Ownable_init();
@@ -101,7 +101,7 @@ contract LyLevel is Initializable, OwnableUpgradeable, IERC20 {
     }
 
     function mint(address _to, uint256 _amount) external {
-        require(_msgSender() == minter, "LyLevel:!minter");
+        require(_msgSender() == minter, "LyLevel: !minter");
         _mint(_to, _amount);
     }
 
@@ -115,12 +115,13 @@ contract LyLevel is Initializable, OwnableUpgradeable, IERC20 {
     }
 
     function claim(uint256 _batchId, address _receiver) external {
-        require(address(rewardFund) != address(0), "LyLevel: reward fund not set");
+        require(rewardToken != IERC20(address(0)), "LyLevel: reward token not set");
         address sender = _msgSender();
         uint256 amount = claimable(_batchId, sender);
         require(amount != 0, "LyLevel: nothing to claim");
         userClaimed[_batchId][sender] += amount;
-        rewardFund.requestTransfer(_receiver, amount);
+        totalUnclaimReward -= amount;
+        _safeTransferReward(_receiver, amount);
         emit Claimed(sender, _batchId, amount, _receiver);
     }
 
@@ -184,26 +185,43 @@ contract LyLevel is Initializable, OwnableUpgradeable, IERC20 {
         }
     }
 
+    // Safe reward transfer function, just in case if rounding error causes pool to not have enough reward.
+    function _safeTransferReward(address _to, uint256 _amount) internal {
+        uint256 rewardBalance = rewardToken.balanceOf(address(this));
+        if (_amount > rewardBalance) {
+            rewardToken.transfer(_to, rewardBalance);
+        } else {
+            rewardToken.transfer(_to, _amount);
+        }
+    }
+
     /* ========== RESTRICTIVE FUNCTIONS ========== */
-    function setRewardFund(address _rewardFund) external onlyOwner {
-        rewardFund = ITokenReserve(_rewardFund);
-        emit RewardFundSet(_rewardFund);
+    function setRewardToken(address _rewardToken) external onlyOwner {
+        require(rewardToken == IERC20(address(0)), "LyLevel: reward token already set");
+        rewardToken = IERC20(_rewardToken);
+        emit RewardTokenSet(_rewardToken);
     }
 
     function setMinter(address _minter) external onlyOwner {
-        require(_minter != address(0), "LyLevel:zero address");
+        require(_minter != address(0), "LyLevel: zero address");
         minter = _minter;
         emit MinterSet(_minter);
     }
 
     /// @notice allocate reward for current batch and start a new batch
     function allocateReward(uint256 _totalAmount) external onlyOwner {
-        require(totalSupply() > 0, "LyLevel:no supply");
+        require(rewardToken != IERC20(address(0)), "LyLevel: reward token not set");
+        require(totalSupply() > 0, "LyLevel: no supply");
+        require(
+            totalUnclaimReward + _totalAmount <= rewardToken.balanceOf(address(this)),
+            "LyLevel: insufficient reward balance"
+        );
         RedeemProgramInfo memory info = RedeemProgramInfo({
             totalBalance: totalSupply(),
             rewardPerShare: _totalAmount * PRECISION / totalSupply(),
             allocatedTime: block.timestamp
         });
+        totalUnclaimReward += _totalAmount;
         redeemPrograms[currentBatchId] = info;
         emit RewardAllocated(currentBatchId, _totalAmount);
         currentBatchId++;
@@ -215,5 +233,5 @@ contract LyLevel is Initializable, OwnableUpgradeable, IERC20 {
     event Claimed(address indexed user, uint256 indexed batchId, uint256 amount, address to);
     event RewardAllocated(uint256 indexed batchId, uint256 amount);
     event BatchStarted(uint256 id);
-    event RewardFundSet(address fund);
+    event RewardTokenSet(address token);
 }

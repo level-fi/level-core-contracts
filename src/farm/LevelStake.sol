@@ -6,7 +6,6 @@ import {ERC20} from "openzeppelin/token/ERC20/ERC20.sol";
 import {OwnableUpgradeable} from "openzeppelin-upgradeable/access/OwnableUpgradeable.sol";
 import {Initializable} from "openzeppelin-upgradeable/proxy/utils/Initializable.sol";
 import {ILevelStake} from "../interfaces/ILevelStake.sol";
-import {ITokenReserve} from "../interfaces/ITokenReserve.sol";
 
 /**
  * @title LevelStake
@@ -31,7 +30,6 @@ contract LevelStake is Initializable, OwnableUpgradeable, ILevelStake {
     IERC20 public LVL;
     IERC20 public LGO;
 
-    ITokenReserve public lgoReserve;
     uint256 public rewardPerSecond;
     uint256 public accRewardPerShare;
     uint256 public lastRewardTime;
@@ -42,19 +40,14 @@ contract LevelStake is Initializable, OwnableUpgradeable, ILevelStake {
      * @dev Called by the proxy contract
      *
      */
-    function initialize(address _lvl, address _lgo, uint256 _rewardPerSecond, address _lgoReserve)
-        external
-        initializer
-    {
+    function initialize(address _lvl, address _lgo, uint256 _rewardPerSecond) external initializer {
         __Ownable_init();
         require(_rewardPerSecond <= MAX_REWARD_PER_SECOND, "> MAX_REWARD_PER_SECOND");
         require(_lvl != address(0), "Invalid LVL address");
         require(_lgo != address(0), "Invalid LVL address");
-        require(_lgoReserve != address(0), "Invalid LGO reserve address");
         LVL = IERC20(_lvl);
         LGO = IERC20(_lgo);
         rewardPerSecond = _rewardPerSecond;
-        lgoReserve = ITokenReserve(_lgoReserve);
     }
 
     /* ========== VIEW FUNCTIONS ========== */
@@ -91,7 +84,7 @@ contract LevelStake is Initializable, OwnableUpgradeable, ILevelStake {
         if (user.amount != 0) {
             uint256 pending = (user.amount * accRewardPerShare) / ACC_REWARD_PRECISION - user.rewardDebt;
             if (pending != 0) {
-                lgoReserve.requestTransfer(_to, pending);
+                _safeTransferLGO(_to, pending);
                 emit RewardsClaimed(msg.sender, _to, pending);
             }
         }
@@ -134,7 +127,7 @@ contract LevelStake is Initializable, OwnableUpgradeable, ILevelStake {
         user.rewardDebt = (user.amount * accRewardPerShare) / ACC_REWARD_PRECISION;
 
         if (pending != 0) {
-            lgoReserve.requestTransfer(_to, pending);
+            _safeTransferLGO(_to, pending);
             emit RewardsClaimed(msg.sender, _to, pending);
         }
 
@@ -170,7 +163,7 @@ contract LevelStake is Initializable, OwnableUpgradeable, ILevelStake {
         user.rewardDebt = accumulatedReward;
 
         if (_pendingReward != 0) {
-            lgoReserve.requestTransfer(_to, _pendingReward);
+            _safeTransferLGO(_to, _pendingReward);
             emit RewardsClaimed(msg.sender, _to, _pendingReward);
         }
     }
@@ -240,6 +233,17 @@ contract LevelStake is Initializable, OwnableUpgradeable, ILevelStake {
                 accRewardPerShare = accRewardPerShare + ((reward * ACC_REWARD_PRECISION) / lvlSupply);
             }
             lastRewardTime = block.timestamp;
+        }
+    }
+
+    // Safe LGO transfer function, just in case if rounding error causes pool to not have enough LGOs.
+    function _safeTransferLGO(address _to, uint256 _amount) internal {
+        require(LGO != IERC20(address(0)), "LGO not set");
+        uint256 lgoBalance = LGO.balanceOf(address(this));
+        if (_amount > lgoBalance) {
+            LGO.transfer(_to, lgoBalance);
+        } else {
+            LGO.transfer(_to, _amount);
         }
     }
 

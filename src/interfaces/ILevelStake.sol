@@ -18,4 +18,8 @@ interface ILevelStake {
     function LVL() external view returns (IERC20);
 
     function LGO() external view returns (IERC20);
+
+    function COOLDOWN_SECONDS() external view returns (uint256);
+
+    function UNSTAKE_WINDOWN() external view returns (uint256);
 }
